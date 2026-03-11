@@ -2,7 +2,6 @@ import os
 import torch
 import yaml
 import torch.nn as nn
-import parser
 from model import ft_net, two_view_net, three_view_net
 
 def make_weights_for_balanced_classes(images, nclasses):
@@ -56,11 +55,11 @@ def load_network(name, opt):
     last_model_name = os.path.basename(get_model_list(dirname, 'net'))
     epoch = last_model_name.split('_')[1]
     epoch = epoch.split('.')[0]
-    if not epoch=='last':
+    if epoch not in ('last', 'best'):
        epoch = int(epoch)
     config_path = os.path.join(dirname,'opts.yaml')
     with open(config_path, 'r') as stream:
-        config = yaml.load(stream)
+        config = yaml.load(stream, Loader=yaml.FullLoader)
 
     opt.name = config['name']
     opt.data_dir = config['data_dir']

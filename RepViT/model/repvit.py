@@ -246,6 +246,37 @@ class RepViT(nn.Module):
 
 from timm.models import register_model
 
+_repvit_ckpt_urls = {
+    'repvit_m0_9': 'https://github.com/THU-MIG/RepViT/releases/download/v1.0/repvit_m0_9_distill_450e.pth',
+    'repvit_m1_0': 'https://github.com/THU-MIG/RepViT/releases/download/v1.0/repvit_m1_0_distill_450e.pth',
+    'repvit_m1_1': 'https://github.com/THU-MIG/RepViT/releases/download/v1.0/repvit_m1_1_distill_450e.pth',
+    'repvit_m1_5': 'https://github.com/THU-MIG/RepViT/releases/download/v1.0/repvit_m1_5_distill_450e.pth',
+    'repvit_m2_3': 'https://github.com/THU-MIG/RepViT/releases/download/v1.0/repvit_m2_3_distill_450e.pth',
+}
+
+def _load_pretrained(model, variant):
+    import os
+    url = _repvit_ckpt_urls.get(variant)
+    if url is None:
+        print(f'No pretrained weights available for {variant}, training from scratch.')
+        return
+    cache_dir = os.path.join(os.path.expanduser('~'), '.cache', 'repvit')
+    os.makedirs(cache_dir, exist_ok=True)
+    ckpt_name = os.path.basename(url)
+    ckpt_path = os.path.join(cache_dir, ckpt_name)
+    if not os.path.exists(ckpt_path):
+        print(f'Downloading pretrained weights for {variant} from {url} ...')
+        torch.hub.download_url_to_file(url, ckpt_path)
+    checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+    if 'model' in checkpoint:
+        checkpoint = checkpoint['model']
+    missing, unexpected = model.load_state_dict(checkpoint, strict=False)
+    if missing:
+        print(f'Missing keys when loading pretrained {variant}: {missing}')
+    if unexpected:
+        print(f'Unexpected keys when loading pretrained {variant}: {unexpected}')
+    print(f'Loaded pretrained weights for {variant} from {ckpt_path}')
+
 
 @register_model
 def repvit_m0_6(pretrained=False, num_classes = 1000, distillation=False):
@@ -307,7 +338,10 @@ def repvit_m0_9(pretrained=False, num_classes = 1000, distillation=False):
         [3,   2, 384, 1, 1, 1],
         [3,   2, 384, 0, 1, 1]
     ]
-    return RepViT(cfgs, num_classes=num_classes, distillation=distillation)
+    model = RepViT(cfgs, num_classes=num_classes, distillation=distillation)
+    if pretrained:
+        _load_pretrained(model, 'repvit_m0_9')
+    return model
 
 @register_model
 def repvit_m1_0(pretrained=False, num_classes = 1000, distillation=False):
@@ -343,7 +377,10 @@ def repvit_m1_0(pretrained=False, num_classes = 1000, distillation=False):
         [3,   2, 448, 1, 1, 1],
         [3,   2, 448, 0, 1, 1]
     ]
-    return RepViT(cfgs, num_classes=num_classes, distillation=distillation)
+    model = RepViT(cfgs, num_classes=num_classes, distillation=distillation)
+    if pretrained:
+        _load_pretrained(model, 'repvit_m1_0')
+    return model
 
 
 @register_model
@@ -378,7 +415,10 @@ def repvit_m1_1(pretrained=False, num_classes = 1000, distillation=False):
         [3,   2, 512, 1, 1, 1],
         [3,   2, 512, 0, 1, 1]
     ]
-    return RepViT(cfgs, num_classes=num_classes, distillation=distillation)
+    model = RepViT(cfgs, num_classes=num_classes, distillation=distillation)
+    if pretrained:
+        _load_pretrained(model, 'repvit_m1_1')
+    return model
 
 
 @register_model
@@ -431,7 +471,10 @@ def repvit_m1_5(pretrained=False, num_classes = 1000, distillation=False):
         [3,   2, 512, 1, 1, 1],
         [3,   2, 512, 0, 1, 1]
     ]
-    return RepViT(cfgs, num_classes=num_classes, distillation=distillation)
+    model = RepViT(cfgs, num_classes=num_classes, distillation=distillation)
+    if pretrained:
+        _load_pretrained(model, 'repvit_m1_5')
+    return model
 
 
 
@@ -501,4 +544,7 @@ def repvit_m2_3(pretrained=False, num_classes = 1000, distillation=False):
         # [3,   2, 640, 1, 1, 1],
         # [3,   2, 640, 0, 1, 1]
     ]    
-    return RepViT(cfgs, num_classes=num_classes, distillation=distillation)
+    model = RepViT(cfgs, num_classes=num_classes, distillation=distillation)
+    if pretrained:
+        _load_pretrained(model, 'repvit_m2_3')
+    return model

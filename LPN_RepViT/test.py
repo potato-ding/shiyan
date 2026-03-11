@@ -52,7 +52,7 @@ opt = parser.parse_args()
 # load the training config
 config_path = os.path.join('./model',opt.name,'opts.yaml')
 with open(config_path, 'r') as stream:
-        config = yaml.load(stream)
+        config = yaml.load(stream, Loader=yaml.FullLoader)
 opt.fp16 = config['fp16'] 
 opt.use_dense = config['use_dense']
 opt.use_NAS = config['use_NAS']
@@ -130,7 +130,7 @@ if opt.multi:
                                              shuffle=False, num_workers=16) for x in ['gallery','query','multi-query']}
 else:
     # image_datasets = {x: datasets.ImageFolder( os.path.join(data_dir,x) ,data_transforms) for x in ['gallery_satellite','gallery_drone', 'gallery_street', 'query_satellite', 'query_drone', 'query_street']}
-    image_datasets = {x: datasets.ImageFolder( os.path.join(data_dir,x) ,data_transforms) for x in ['gallery_satellite','gallery_drone', 'gallery_street', 'gallery_satellite_usa_un']}
+    image_datasets = {x: datasets.ImageFolder( os.path.join(data_dir,x) ,data_transforms) for x in ['gallery_satellite','gallery_drone', 'gallery_street']}
     # image_datasets = {}
     # for x in ['gallery_satellite','gallery_drone', 'gallery_street', 'gallery_satellite_usa_un']:
     #     image_datasets[x] = customData( os.path.join(data_dir,x) ,data_transforms, rotate=0)
@@ -139,7 +139,7 @@ else:
             print('----------scale test--------------')
             image_datasets[x] = customData_one( os.path.join(data_dir,x) ,data_transforms, rotate=0, reverse=False)
     else:
-        for x in ['query_satellite', 'query_drone', 'query_street', 'query_drone_one']:
+        for x in ['query_satellite', 'query_drone', 'query_street']:
             if opt.pad > 0:
                 print('-----------move pixel test-----------')
                 image_datasets[x] = customData( os.path.join(data_dir,x) ,transform_move_list, rotate=0, pad=opt.pad)
@@ -150,10 +150,10 @@ else:
     # image_datasets = {x: customData( os.path.join(data_dir,x) ,data_transforms, rotate=0) for x in ['query_satellite', 'query_drone', 'query_street']}
     if scale_test:
         dataloaders = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=opt.batchsize,
-                                             shuffle=False, num_workers=16) for x in ['gallery_satellite', 'gallery_drone','gallery_street', 'gallery_satellite_usa_un', 'query_drone']}
+                                             shuffle=False, num_workers=16) for x in ['gallery_satellite', 'gallery_drone','gallery_street', 'query_drone']}
     else:
         dataloaders = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=opt.batchsize,
-                                             shuffle=False, num_workers=16) for x in ['gallery_satellite', 'gallery_drone','gallery_street', 'gallery_satellite_usa_un', 'query_satellite', 'query_drone', 'query_street', 'query_drone_one']}
+                                             shuffle=False, num_workers=16) for x in ['gallery_satellite', 'gallery_drone','gallery_street', 'query_satellite', 'query_drone', 'query_street']}
 use_gpu = torch.cuda.is_available()
 
 ######################################################################
@@ -186,18 +186,13 @@ def extract_feature(model,dataloaders, view_index = 1):
         img, label = data
         n, c, h, w = img.size()
         count += n
-        print(count)
         ff = torch.FloatTensor(n,512).zero_().cuda()
-        if opt.LPN:
-            # ff = torch.FloatTensor(n,2048,6).zero_().cuda()
-            ff = torch.FloatTensor(n,512,opt.block).zero_().cuda()
         for i in range(2):
             if(i==1):
                 img = fliplr(img)
             input_img = Variable(img.cuda())
             for scale in ms:
                 if scale != 1:
-                    # bicubic is only  available in pytorch>= 1.1
                     input_img = nn.functional.interpolate(input_img, scale_factor=scale, mode='bilinear', align_corners=False)
                 if opt.views ==2:
                     if view_index == 1:
@@ -212,17 +207,9 @@ def extract_feature(model,dataloaders, view_index = 1):
                     elif view_index ==3:
                         _, _, outputs = model(None, None, input_img)
                 ff += outputs
-        # norm feature
-        if opt.LPN:
-            # feature size (n,2048,6)
-            # 1. To treat every part equally, I calculate the norm for every 2048-dim part feature.
-            # 2. To keep the cosine score==1, sqrt(6) is added to norm the whole feature (2048*6).
-            fnorm = torch.norm(ff, p=2, dim=1, keepdim=True) * np.sqrt(opt.block) 
-            ff = ff.div(fnorm.expand_as(ff))
-            ff = ff.view(ff.size(0), -1)
-        else:
-            fnorm = torch.norm(ff, p=2, dim=1, keepdim=True)
-            ff = ff.div(fnorm.expand_as(ff))
+        # L2 normalize
+        fnorm = torch.norm(ff, p=2, dim=1, keepdim=True)
+        ff = ff.div(fnorm.expand_as(ff))
 
         features = torch.cat((features,ff.data.cpu()), 0)
     return features
@@ -243,18 +230,30 @@ def get_id(img_path):
 print('-------test-----------')
 
 model, _, epoch = load_network(opt.name, opt)
-if opt.LPN:
-    print('use LPN')
-    # model = three_view_net_test(model)
-    for i in range(opt.block):
-        cls_name = 'classifier'+str(i)
-        c = getattr(model, cls_name)
-        c.classifier = nn.Sequential()
-else:
-    model.classifier.classifier = nn.Sequential()
+# In eval mode, three_view_net returns neck features directly — no classifier stripping needed
 model = model.eval()
 if use_gpu:
     model = model.cuda()
+
+# ---- Params & FPS ----
+total_params = sum(p.numel() for p in model.parameters())
+print('Params: {:.2f}M'.format(total_params / 1e6))
+
+if use_gpu:
+    dummy = torch.randn(1, 3, opt.h, opt.w).cuda()
+    # warmup
+    with torch.no_grad():
+        for _ in range(10):
+            _ = model(dummy, None, None) if opt.views == 3 else model(dummy, None)
+    torch.cuda.synchronize()
+    t0 = time.time()
+    n_iter = 100
+    with torch.no_grad():
+        for _ in range(n_iter):
+            _ = model(dummy, None, None) if opt.views == 3 else model(dummy, None)
+    torch.cuda.synchronize()
+    fps = n_iter / (time.time() - t0)
+    print('FPS (single view, bs=1): {:.1f}'.format(fps))
 
 # Extract feature
 since = time.time()

@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.optim import lr_scheduler
 from torch.autograd import Variable
+from torch.nn import functional as F
 from torchvision import datasets, transforms
 import torch.backends.cudnn as cudnn
 import matplotlib
@@ -63,6 +64,9 @@ parser.add_argument('--LPN', action='store_true', help='use LPN' )
 parser.add_argument('--block', default=6, type=int, help='the num of block' )
 parser.add_argument('--repvit_variant', default='repvit_m1_1', type=str, help='RepViT backbone variant, e.g. repvit_m1_1/repvit_m1_5/repvit_m2_3')
 parser.add_argument('--fp16', action='store_true', help='use float16 instead of float32, which will save about 50% memory' )
+parser.add_argument('--num_epochs', default=120, type=int, help='total number of training epochs')
+parser.add_argument('--triplet_beta', default=2.0, type=float, help='weight for cross-view triplet loss (0 to disable)')
+parser.add_argument('--triplet_margin', default=0.3, type=float, help='margin for triplet loss')
 opt = parser.parse_args()
 
 if opt.resume:
@@ -145,7 +149,7 @@ image_datasets['street'] = datasets.ImageFolder(os.path.join(data_dir, 'street')
 image_datasets['drone'] = datasets.ImageFolder(os.path.join(data_dir, 'drone'),
                                           data_transforms['train'])
 image_datasets['google'] = datasets.ImageFolder(os.path.join(data_dir, 'google'),
-                                          data_transforms['train'])
+                                          data_transforms['train'], allow_empty=True)
 
 dataloaders = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=opt.batchsize,
                                              shuffle=True, num_workers=4, pin_memory=False) # 8 workers may work faster
@@ -175,6 +179,52 @@ y_err = {}
 y_err['train'] = []
 y_err['val'] = []
 
+def cross_view_triplet_loss(feat1, labels1, feat2, labels2, margin=0.3):
+    """Batch-hard cross-view triplet loss.
+    For each anchor in one view, find hardest positive (same label) and
+    hardest negative (different label) in the other view. Bidirectional.
+    Returns 0 if no valid triplets found.
+    """
+    dist = torch.cdist(feat1, feat2, p=2)  # (B1, B2)
+    label_match = (labels1.unsqueeze(1) == labels2.unsqueeze(0))  # (B1, B2)
+
+    total_loss = torch.tensor(0.0, device=feat1.device)
+    count = 0
+
+    # Direction 1: anchor in feat1, pos/neg in feat2
+    has_pos = label_match.any(dim=1)
+    has_neg = (~label_match).any(dim=1)
+    valid = has_pos & has_neg
+    if valid.any():
+        pos_dist = dist.clone()
+        pos_dist[~label_match] = -1e9
+        hardest_pos = pos_dist[valid].max(dim=1)[0]
+        neg_dist = dist.clone()
+        neg_dist[label_match] = 1e9
+        hardest_neg = neg_dist[valid].min(dim=1)[0]
+        total_loss = total_loss + F.relu(hardest_pos - hardest_neg + margin).mean()
+        count += 1
+
+    # Direction 2: anchor in feat2, pos/neg in feat1
+    dist_t = dist.t()
+    label_match_t = label_match.t()
+    has_pos = label_match_t.any(dim=1)
+    has_neg = (~label_match_t).any(dim=1)
+    valid = has_pos & has_neg
+    if valid.any():
+        pos_dist = dist_t.clone()
+        pos_dist[~label_match_t] = -1e9
+        hardest_pos = pos_dist[valid].max(dim=1)[0]
+        neg_dist = dist_t.clone()
+        neg_dist[label_match_t] = 1e9
+        hardest_neg = neg_dist[valid].min(dim=1)[0]
+        total_loss = total_loss + F.relu(hardest_pos - hardest_neg + margin).mean()
+        count += 1
+
+    if count > 0:
+        return total_loss / count
+    return total_loss
+
 def one_LPN_output(outputs, labels, criterion, block):
     # part = {}
     sm = nn.Softmax(dim=1)
@@ -193,8 +243,7 @@ def one_LPN_output(outputs, labels, criterion, block):
 def train_model(model, model_test, criterion, optimizer, scheduler, num_epochs=25):
     since = time.time()
 
-    #best_model_wts = model.state_dict()
-    #best_acc = 0.0
+    best_acc = 0.0
     warm_up = 0.1 # We start from the 0.1*lrRate
     warm_iteration = round(dataset_sizes['satellite']/opt.batchsize)*opt.warm_epoch # first 5 epoch
 
@@ -211,6 +260,8 @@ def train_model(model, model_test, criterion, optimizer, scheduler, num_epochs=2
                 model.train(False)  # Set model to evaluate mode
 
             running_loss = 0.0
+            running_loss_id = 0.0
+            running_loss_triplet = 0.0
             running_corrects = 0.0
             running_corrects2 = 0.0
             running_corrects3 = 0.0
@@ -268,7 +319,7 @@ def train_model(model, model_test, criterion, optimizer, scheduler, num_epochs=2
                     preds, loss = one_LPN_output(outputs, labels, criterion, opt.block)
                     preds2, loss2 = one_LPN_output(outputs2, labels2, criterion, opt.block)
 
-                    if opt.views == 2:       # no implement this LPN model
+                    if opt.views == 2:
                         loss = loss + loss2
                     elif opt.views == 3:
                         preds3, loss3 = one_LPN_output(outputs3, labels3, criterion, opt.block)
@@ -276,6 +327,16 @@ def train_model(model, model_test, criterion, optimizer, scheduler, num_epochs=2
                         if opt.extra_Google:
                             _, loss4 = one_LPN_output(outputs4, labels4, criterion, opt.block)
                             loss = loss + loss4
+
+                loss_id = loss.item()
+                # Cross-view triplet loss (satellite <-> drone)
+                loss_triplet_val = 0.0
+                if opt.views == 3 and opt.triplet_beta > 0 and hasattr(model, '_feat1') and hasattr(model, '_feat3'):
+                    feat_sat = F.normalize(model._feat1, p=2, dim=1)
+                    feat_drone = F.normalize(model._feat3, p=2, dim=1)
+                    loss_triplet = cross_view_triplet_loss(feat_sat, labels, feat_drone, labels3, margin=opt.triplet_margin)
+                    loss_triplet_val = loss_triplet.item()
+                    loss = loss + opt.triplet_beta * loss_triplet
 
                 # backward + optimize only if in training phase
                 if epoch<opt.warm_epoch and phase == 'train': 
@@ -296,8 +357,12 @@ def train_model(model, model_test, criterion, optimizer, scheduler, num_epochs=2
                 # statistics
                 if int(version[0])>0 or int(version[2]) > 3: # for the new version like 0.4.0, 0.5.0 and 1.0.0
                     running_loss += loss.item() * now_batch_size
+                    running_loss_id += loss_id * now_batch_size
+                    running_loss_triplet += loss_triplet_val * now_batch_size
                 else :  # for the old version like 0.3.0 and 0.3.1
                     running_loss += loss.data[0] * now_batch_size
+                    running_loss_id += loss_id * now_batch_size
+                    running_loss_triplet += loss_triplet_val * now_batch_size
                 running_corrects += float(torch.sum(preds == labels.data))
                 running_corrects2 += float(torch.sum(preds2 == labels2.data))
                 if opt.views == 3:
@@ -311,7 +376,10 @@ def train_model(model, model_test, criterion, optimizer, scheduler, num_epochs=2
                 print('{} Loss: {:.4f} Satellite_Acc: {:.4f}  Street_Acc: {:.4f}'.format(phase, epoch_loss, epoch_acc, epoch_acc2))
             elif opt.views == 3:
                 epoch_acc3 = running_corrects3 / dataset_sizes['satellite']
-                print('{} Loss: {:.4f} Satellite_Acc: {:.4f}  Street_Acc: {:.4f} Drone_Acc: {:.4f}'.format(phase, epoch_loss, epoch_acc, epoch_acc2, epoch_acc3))
+                epoch_loss_id = running_loss_id / dataset_sizes['satellite']
+                epoch_loss_triplet = running_loss_triplet / dataset_sizes['satellite']
+                print('{} Loss: {:.4f}  ID_Loss: {:.4f}  Triplet_Loss: {:.4f}'.format(phase, epoch_loss, epoch_loss_id, epoch_loss_triplet))
+                print('Satellite_Acc: {:.4f}  Street_Acc: {:.4f}  Drone_Acc: {:.4f}'.format(epoch_acc, epoch_acc2, epoch_acc3))
 
             y_loss[phase].append(epoch_loss)
             y_err[phase].append(1.0-epoch_acc)            
@@ -321,6 +389,12 @@ def train_model(model, model_test, criterion, optimizer, scheduler, num_epochs=2
             last_model_wts = model.state_dict()
             if epoch%20 == 19:
                 save_network(model, opt.name, epoch)
+            # save best model based on average accuracy
+            avg_acc = (epoch_acc + epoch_acc3) / 2.0 if opt.views == 3 else epoch_acc
+            if avg_acc > best_acc:
+                best_acc = avg_acc
+                save_network(model, opt.name, 'best')
+                print('** Best model updated at epoch {} with avg_acc: {:.4f} **'.format(epoch, avg_acc))
             #draw_curve(epoch)
 
         time_elapsed = time.time() - since
@@ -331,8 +405,7 @@ def train_model(model, model_test, criterion, optimizer, scheduler, num_epochs=2
     time_elapsed = time.time() - since
     print('Training complete in {:.0f}m {:.0f}s'.format(
         time_elapsed // 60, time_elapsed % 60))
-    #print('Best val Acc: {:4f}'.format(best_acc))
-    #save_network(model_test, opt.name+'adapt', epoch)
+    print('Best Acc: {:4f}'.format(best_acc))
 
     return model
 
@@ -369,10 +442,7 @@ if opt.views == 2:
     else:
         model = two_view_net(len(class_names), droprate = opt.droprate, stride = opt.stride, pool = opt.pool, share_weight = opt.share, repvit_variant=opt.repvit_variant)
 elif opt.views == 3:
-    if opt.LPN:
-        model = three_view_net(len(class_names), droprate = opt.droprate, stride = opt.stride, pool = opt.pool, share_weight = opt.share, LPN = True, block = opt.block, repvit_variant=opt.repvit_variant)
-    else:
-        model = three_view_net(len(class_names), droprate = opt.droprate, stride = opt.stride, pool = opt.pool, share_weight = opt.share, repvit_variant=opt.repvit_variant)
+    model = three_view_net(len(class_names), droprate = opt.droprate, stride = opt.stride, pool = opt.pool, share_weight = opt.share, repvit_variant=opt.repvit_variant)
 
 opt.nclasses = len(class_names)
 
@@ -380,33 +450,40 @@ print(model)
 # For resume:
 if start_epoch>=40:
     opt.lr = opt.lr*0.1
-if not opt.LPN:
-    ignored_params = list(map(id, model.classifier.parameters() ))
-    base_params = filter(lambda p: id(p) not in ignored_params, model.parameters())
-    optimizer_ft = optim.SGD([
-                {'params': base_params, 'lr': 0.1*opt.lr},
-                {'params': model.classifier.parameters(), 'lr': opt.lr}
-            ], weight_decay=5e-4, momentum=0.9, nesterov=True)
+
+if opt.views == 3:
+    # Backbone params at lower lr, neck+classifier at opt.lr
+    head_params = list(model.classifier.parameters()) + list(model.neck.parameters())
+    head_ids = list(map(id, head_params))
+    base_params = filter(lambda p: id(p) not in head_ids, model.parameters())
+    optimizer_ft = optim.AdamW([
+                {'params': base_params, 'lr': 1e-4},
+                {'params': head_params, 'lr': opt.lr}
+            ], weight_decay=0.05)
 else:
-    # ignored_params = list(map(id, model.model.fc.parameters() ))
-    ignored_params =list()
-    for i in range(opt.block):
-        cls_name = 'classifier'+str(i)
-        c = getattr(model, cls_name)
-        ignored_params += list(map(id, c.parameters() ))
+    if not opt.LPN:
+        ignored_params = list(map(id, model.classifier.parameters() ))
+        base_params = filter(lambda p: id(p) not in ignored_params, model.parameters())
+        optimizer_ft = optim.AdamW([
+                    {'params': base_params, 'lr': 1e-4},
+                    {'params': model.classifier.parameters(), 'lr': opt.lr}
+                ], weight_decay=0.05)
+    else:
+        ignored_params =list()
+        for i in range(opt.block):
+            cls_name = 'classifier'+str(i)
+            c = getattr(model, cls_name)
+            ignored_params += list(map(id, c.parameters() ))
+        base_params = filter(lambda p: id(p) not in ignored_params, model.parameters())
+        optim_params = [{'params': base_params, 'lr': 1e-4}]
+        for i in range(opt.block):
+            cls_name = 'classifier'+str(i)
+            c = getattr(model, cls_name)
+            optim_params.append({'params': c.parameters(), 'lr': opt.lr})
+        optimizer_ft = optim.AdamW(optim_params, weight_decay=0.05)
 
-    base_params = filter(lambda p: id(p) not in ignored_params, model.parameters())
-
-    optim_params = [{'params': base_params, 'lr': 0.1*opt.lr}]
-    for i in range(opt.block):
-        cls_name = 'classifier'+str(i)
-        c = getattr(model, cls_name)
-        optim_params.append({'params': c.parameters(), 'lr': opt.lr})
-
-    optimizer_ft = optim.SGD(optim_params, weight_decay=5e-4, momentum=0.9, nesterov=True)
-
-# Decay LR by a factor of 0.1 every 40 epochs
-exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=80, gamma=0.1)
+# Cosine annealing LR scheduler
+exp_lr_scheduler = lr_scheduler.CosineAnnealingLR(optimizer_ft, T_max=opt.num_epochs, eta_min=1e-6)
 
 ######################################################################
 # Train and evaluate
@@ -433,10 +510,10 @@ if fp16:
 criterion = nn.CrossEntropyLoss()
 if opt.moving_avg<1.0:
     model_test = copy.deepcopy(model)
-    num_epochs = 140
+    num_epochs = opt.num_epochs + 20
 else:
     model_test = None
-    num_epochs = 120
+    num_epochs = opt.num_epochs
 
 model = train_model(model, model_test, criterion, optimizer_ft, exp_lr_scheduler,
                        num_epochs=num_epochs)

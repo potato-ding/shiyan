@@ -1,7 +1,7 @@
 # LPN  
 python train.py \
 --name='final_three_view_long_share_d0.75_256_s1_google_LPN4_lr0.001' \
---data_dir='/home/wangtyu/datasets/University-Release/train' \
+--data_dir='/root/shiyan/U1652/train' \
 --views=3 \
 --droprate=0.75 \
 --share \
@@ -17,14 +17,14 @@ python train.py \
 
 python test.py \
 --name='final_three_view_long_share_d0.75_256_s1_google_LPN4_lr0.001' \
---test_dir='/home/wangtyu/datasets/University-Release/test' \
+--test_dir='/root/shiyan/U1652/test' \
 --batchsize=128 \
 --gpu_ids='0'
 
 # Baseline
 # python train.py \
 # --name='three_view_long_share_d0.75_256_s1_google_lr0.01' \
-# --data_dir='/home/wangtyu/datasets/University-Release/train' \
+# --data_dir='/root/shiyan/U1652/train' \
 # --views=3 \
 # --droprate=0.75 \
 # --extra \
@@ -38,5 +38,5 @@ python test.py \
 
 # python test.py \
 # --name='three_view_long_share_d0.75_256_s1_google_lr0.01' \
-# --test_dir='/home/wangtyu/datasets/University-Release/test' \
+# --test_dir='/root/shiyan/U1652/test' \
 # --gpu_ids='0'

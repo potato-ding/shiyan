@@ -31,7 +31,8 @@ def weights_init_classifier(m):
     classname = m.__class__.__name__
     if classname.find('Linear') != -1:
         init.normal_(m.weight.data, std=0.001)
-        init.constant_(m.bias.data, 0.0)
+        if m.bias is not None:
+            init.constant_(m.bias.data, 0.0)
 
 def fix_relu(m):
     classname = m.__class__.__name__
@@ -45,8 +46,8 @@ class RepViTFeatureBackbone(nn.Module):
         if not hasattr(repvit_model, variant):
             raise ValueError('Unsupported RepViT variant: %s' % variant)
         self.variant = variant
-        self.model = getattr(repvit_model, variant)(pretrained=False, num_classes=1000, distillation=False)
-        self.out_channels = self.model.features[-1].channel_mixer.m.conv.c.out_channels
+        self.model = getattr(repvit_model, variant)(pretrained=True, num_classes=1000, distillation=False)
+        self.out_channels = self.model.features[-1].channel_mixer.m[2].c.out_channels
 
     def forward(self, x):
         for block in self.model.features:
@@ -608,105 +609,73 @@ class two_view_net(nn.Module):
 class three_view_net(nn.Module):
     def __init__(self, class_num, droprate, stride = 2, pool = 'avg', share_weight = False, VGG16=False, LPN=False, block=6, repvit_variant='repvit_m1_1'):
         super(three_view_net, self).__init__()
-        self.LPN = LPN
-        self.block = block
-        if VGG16:
-            self.model_1 =  ft_net_VGG16(class_num, stride = stride, pool = pool)
-            self.model_2 =  ft_net_VGG16(class_num, stride = stride, pool = pool)
-        elif LPN:
-            self.model_1 =  ft_net_LPN(class_num, stride = stride, pool = pool, block = block, repvit_variant=repvit_variant)
-            self.model_2 =  ft_net_LPN(class_num, stride = stride, pool = pool, block = block, repvit_variant=repvit_variant)
-            # self.block = self.model_1.block
-        else: 
-            self.model_1 =  ft_net(class_num, stride = stride, pool = pool, repvit_variant=repvit_variant)
-            self.model_2 =  ft_net(class_num, stride = stride, pool = pool, repvit_variant=repvit_variant)
-
+        # Satellite branch
+        self.model_1 = ft_net(class_num, stride=stride, pool=pool, repvit_variant=repvit_variant)
+        # Street branch
+        self.model_2 = ft_net(class_num, stride=stride, pool=pool, repvit_variant=repvit_variant)
+        # Drone branch (shared with satellite if share_weight)
         if share_weight:
             self.model_3 = self.model_1
         else:
-            if VGG16:
-                self.model_3 =  ft_net_VGG16(class_num, stride = stride, pool = pool)
-            elif LPN:
-                self.model_3 =  ft_net_LPN(class_num, stride = stride, pool = pool, block = block, repvit_variant=repvit_variant)
-            else:
-                self.model_3 =  ft_net(class_num, stride = stride, pool = pool, repvit_variant=repvit_variant)
-        repvit_dim = self.model_1.out_channels
-        if pool == 'avg+max':
-            repvit_dim = repvit_dim * 2
-        if LPN:
-            for i in range(self.block):
-                name = 'classifier'+str(i)
-                setattr(self, name, ClassBlock(repvit_dim, class_num, droprate))
-        else:    
-            self.classifier = ClassBlock(repvit_dim, class_num, droprate)
+            self.model_3 = ft_net(class_num, stride=stride, pool=pool, repvit_variant=repvit_variant)
 
-    def forward(self, x1, x2, x3, x4 = None): # x4 is extra data
-        if self.LPN:
+        feat_dim = self.model_1.out_channels  # 512
+
+        # Neck: BN1d for feature normalization
+        self.neck = nn.BatchNorm1d(feat_dim)
+        self.neck.bias.requires_grad_(False)
+        self.neck.apply(weights_init_kaiming)
+
+        # Classification head
+        self.classifier = nn.Linear(feat_dim, class_num, bias=False)
+        self.classifier.apply(weights_init_classifier)
+
+    def forward(self, x1, x2, x3, x4=None):
+        if self.training:
+            # ----- Training: return logits, store neck features -----
             if x1 is None:
                 y1 = None
             else:
-                x1 = self.model_1(x1)
-                y1 = self.part_classifier(x1)
+                f1 = self.neck(self.model_1(x1))
+                self._feat1 = f1
+                y1 = self.classifier(f1)
 
             if x2 is None:
                 y2 = None
             else:
-                x2 = self.model_2(x2)
-                y2 = self.part_classifier(x2)
+                f2 = self.neck(self.model_2(x2))
+                y2 = self.classifier(f2)
 
             if x3 is None:
                 y3 = None
             else:
-                x3 = self.model_3(x3)
-                y3 = self.part_classifier(x3)
+                f3 = self.neck(self.model_3(x3))
+                self._feat3 = f3
+                y3 = self.classifier(f3)
 
-            if x4 is None:
-                return y1, y2, y3
-            else:
-                x4 = self.model_2(x4)
-                y4 = self.part_classifier(x4)
+            if x4 is not None:
+                f4 = self.neck(self.model_2(x4))
+                y4 = self.classifier(f4)
                 return y1, y2, y3, y4
+            return y1, y2, y3
         else:
+            # ----- Eval: return neck features only -----
             if x1 is None:
                 y1 = None
             else:
-                x1 = self.model_1(x1)
-                y1 = self.classifier(x1)
+                y1 = self.neck(self.model_1(x1))
 
             if x2 is None:
                 y2 = None
             else:
-                x2 = self.model_2(x2)
-                y2 = self.classifier(x2)
+                y2 = self.neck(self.model_2(x2))
 
             if x3 is None:
                 y3 = None
             else:
-                x3 = self.model_3(x3)
-                y3 = self.classifier(x3)
+                y3 = self.neck(self.model_3(x3))
 
-            if x4 is None:
-                return y1, y2, y3
-            else:
-                x4 = self.model_2(x4)
-                y4 = self.classifier(x4)
-                return y1, y2, y3, y4
-
-    def part_classifier(self, x):
-        part = {}
-        predict = {}
-        for i in range(self.block):
-            part[i] = x[:,:,i].view(x.size(0),-1)
-            # part[i] = torch.squeeze(x[:,:,i])
-            name = 'classifier'+str(i)
-            c = getattr(self, name)
-            predict[i] = c(part[i])
-        y = []
-        for i in range(self.block):
-            y.append(predict[i])
-        if not self.training:
-            return torch.stack(y, dim=2)
-        return y
+            return y1, y2, y3
 
 
 '''
